@@ -1,0 +1,221 @@
+# Background Tasks in FastAPI
+================================
+
+What are Background Tasks and why do we need them?
+
+
+Web APIs follow a simple lifecycle:
+Client → Request → Server processes → Response → Connection closed
+
+Now imagine an endpoint where I need to send email, generate pdf, etc.
+What if:
+Email sending takes 5 seconds
+PDF generation takes 10 seconds
+Now your API response takes 15+ seconds.
+
+Problems:
+    User waits
+    Browser may timeout
+    Server thread is blocked
+    Poor UX
+    Poor scalability
+
+Hence, we need to separate
+
+🟢 Critical work → Must complete before responding
+🔵 Non-critical work → Can happen after response
+
+Example:
+Critical	        Background
+Save user in DB	    Send email
+Validate request	Generate report
+Verify payment	    Send notification
+
+==========================================================
+
+We have a built in FastAPI Background task, which works internally as follows :
+    Task is added to a list
+    After response is sent
+    FastAPI executes it in the same process
+
+But we have limitations : 
+    It still runs in the same server
+    If server crashes → task is lost
+    Not distributed
+    No retry mechanism
+
+Hence we use Celery. 
+
+==========================================================
+
+Celery : 
+Celery is a powerful, production-ready asynchronous job queue, which allows you to run time-consuming Python functions in the background.
+The internal working of Celery can be stated as the Producer/Consumer model  : 
+
+Producer
+Producers are basically web services that handle web requests.
+During the request processing, the time-taking tasks or the periodic tasks are pushed into the message queue.
+
+Queue
+Celery communicates via messages, usually using a broker to mediate between clients and workers. To initiate a task the client adds a message to the queue(the broker) and then delivers that message to a worker. Here the queue can be referred to as Redis, RabbitMQ, or many other services supported by Celery.
+
+Consumers
+Consumers are the worker nodes. The main difference between the web and worker is that web nodes receive requests from the internet and place tasks to be processed asynchronously in the queue and worker nodes are the machines that pick these tasks and execute them.
+
+==========================================================
+
+High level idea of what we weill be doing : 
+Let's take example of when the user sign’s up on the particular website and receives an verification email.
+
+After receiving the client’s request the server enqueues a new task(python function to send email) in the Redis(an in-memory data store) which works as a message queue.
+These tasks will not run on our main FastAPI webserver. Instead, Celery will manage separate servers that can run the tasks simultaneously in the background.
+The Celery worker picks up the task from the queue and executes it asynchronously which enables the web application to respond quickly to the request.
+Whenever a new task arrives, one worker picks it up and processes it.
+Hence celery decreased the performance load from web application by running the functionality of the server asynchronously.
+
+==========================================================
+
+Understanding deeper how celery works : 
+
+Client request -> Uvicorn server -> Validation and store into the database -> FastAPI adds the task to the queue -> Response is sent back to the client.
+Now, we will be having a celery worker running infinitely, which will look for tasks in the redis, if found, it picks up and the worker executes the task. 
+If response is configured, it gets stored in the redis, or else the response is not stored. So, in this way our server need not wait. The tasks are scheduled and executed when are workers are free. 
+
+This is what make our task go into the redis --> send_email_task.delay("abc@gmail.com") 
+
+A series of steps happen internally : 
+Step 1: Task Serialization
+
+    Celery converts:
+    send_email_task("abc@gmail.com")
+
+    Into:
+
+    {
+    "task": "tasks.send_email_task",
+    "id": "random-uuid",
+    "args": ["abc@gmail.com"],
+    "kwargs": {}
+    }
+
+    This is serialized (usually JSON). We do this as worker accepts json.
+
+Step 2: Push to Broker (Redis)
+
+    That serialized message is stored in: Redis
+
+    Inside Redis:
+    It goes into a queue list
+    Stored in memory
+    Persistent (if configured)
+
+    Now FastAPI is DONE.
+    Response sent.
+
+Step 3: Worker Polling
+
+    Celery Worker process (separate process):
+    Constantly listens to Redis
+    Polls queue
+    When task appears
+    Pulls it
+
+    Worker is started using: Celery
+
+Step 4: Task Execution
+
+    Worker:
+    Deserializes message
+    Finds function path
+    Imports module
+    Executes function
+    Stores result in backend (Redis or DB)
+
+==========================================================
+
+Async vs Background Tasks
+
+Even if you use: async def endpoint():
+
+It does NOT mean:
+    CPU heavy tasks become fast
+    Long tasks become safe
+
+Async only helps with I/O concurrency.
+CPU-heavy tasks still block.
+Celery solves that by moving work to separate processes.
+
+==========================================================
+
+Implementation : 
+
+1. Install celery and flower 
+   Flower is a real-time, web-based monitoring tool specifically designed for Celery, a distributed task queue system used for managing background jobs in Python applications. It provides a visual dashboard to monitor task progress, worker status, and history, making it essential for debugging, performance tuning, and managing Celery clusters.
+
+   pip install celery flower
+
+2. Set up .env variables to store the redis URL : 
+   REDIS_URL would be redis://localhost:6379/0
+   Here, /0 specifies the database number to use. A single Redis server can manage multiple logical databases, identified by integer indices (typically 0 through 15 by default). The /0 indicates that the connection should use the first, and default, database.
+
+   Also we update config.py to include REDIS_URL and add celery configurations.
+   Note :
+   Celery expects specific config variable names.
+
+    Example valid names:
+    broker_url
+    result_backend
+    task_serializer
+    result_serializer
+
+
+3. Set up celery src/celery_tasks.py:
+   We import celery and create an instance of it. 
+   The object/instance : 
+    registers tasks
+    connects to broker
+    runs workers
+    handles configuration
+
+   So this object is the central controller for Celery.
+   Then, we need to tell celery how to connect with redis, so we use c_app.config_from_object("src.config").
+   SO all the celery related configurations will be read from config file. 
+
+4. Create a celery task : 
+   A celery task is the task which should run in the background, in our case that is sending mail. 
+   We already have our mail settings in src/mail.py. Here we have create_message() function, which accepts recipients, subject and body. 
+   So our backgroud task will be a function, which will accept these 3 parameters. We call the create_message() function and then we send email using mail.send_message.
+   This function will be wrappped with a decorator --> c_app.task()
+   But why do we wrap?
+   This decorator registers the function as a Celery task.
+   Without it, Celery has no idea the function exists, ie, Celery would not register the function, and the worker wouldn't know about it.
+   Worker while executing the task, looks at the task registry, if the function is not found in task registery, it can't execute the function.
+
+   Note : WHile celery is asynchronous, the workers while executing the task, they execute synchronously.
+          SO, we need to find a way to run our async function inside the task. For that we use async_to_sync() from asgiref. 
+
+5. Run a celery worker on the terminal using : 
+   celery -A src.celery_tasks.c_app worker --loglevel=INFO
+
+   We must run these worker for tasks to be executed. If the worker is not running, tasks will just sit in the queue (Redis) and never get processed.
+
+6. Modify FastAPI endpoint to use celery : 
+   Here, we just call our background task with .delay method. 
+   The .delay() method in Celery is a convenient shortcut for sending a task message to the message broker for asynchronous execution. 
+
+7. Testing celery: 
+   We call the function with .delay manually and cehck celery worker terminal to see that it has been executed. 
+   We can also use flower. Flower is an open-source, web-based tool for real-time monitoring and administration of Celery distributed task queues.
+
+==================================================================================================
+
+
+NOTE : 
+This is a clone of email_verification, hence no alembic is present here. We use the same auth_db. 
+   
+
+
+
+
+
+
